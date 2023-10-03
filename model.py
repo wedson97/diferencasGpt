@@ -1,15 +1,17 @@
 import numpy as np
 import tensorflow as tf
-from tensorflow.contrib.training import HParams
+# from tensorflow.contrib.training import HParams
+# from tensorflow import HParams
 
 def default_hparams():
-    return HParams(
+    HParams = dict(
         n_vocab=0,
         n_ctx=1024,
         n_embd=768,
         n_head=12,
         n_layer=12,
     )
+    return HParams
 
 def shape_list(x):
     """Deal with dynamic shape in tensorflow cleanly."""
@@ -27,14 +29,27 @@ def gelu(x):
 
 def norm(x, scope, *, axis=-1, epsilon=1e-5):
     """Normalize to mean = 0, std = 1, then do a diagonal affine transform."""
-    with tf.variable_scope(scope):
-        n_state = x.shape[-1].value
-        g = tf.get_variable('g', [n_state], initializer=tf.constant_initializer(1))
-        b = tf.get_variable('b', [n_state], initializer=tf.constant_initializer(0))
+    # with tf.name_scope(scope):
+    #     n_state = x.shape[-1]
+    #     g = tf.Variable('g', [n_state], initializer=tf.constant_initializer(1))
+    #     b = tf.Variable('b', [n_state], initializer=tf.constant_initializer(0))
+    #     u = tf.reduce_mean(x, axis=axis, keepdims=True)
+    #     s = tf.reduce_mean(tf.square(x-u), axis=axis, keepdims=True)
+    #     x = (x - u) * tf.rsqrt(s + epsilon)
+    #     x = x*g + b
+    #     return x
+    with tf.name_scope(scope):
+        n_state = x.shape[-1]
+
+        g = tf.Variable(lambda: tf.constant(1, dtype=tf.float32, shape=[n_state]), trainable=True, name='g')
+
+        b = tf.Variable(lambda: tf.constant(0, dtype=tf.float32, shape=[n_state]), trainable=True, name='b')
+
         u = tf.reduce_mean(x, axis=axis, keepdims=True)
-        s = tf.reduce_mean(tf.square(x-u), axis=axis, keepdims=True)
-        x = (x - u) * tf.rsqrt(s + epsilon)
-        x = x*g + b
+        s = tf.reduce_mean(tf.square(x - u), axis=axis, keepdims=True)
+        x = (x - u) * tf.math.rsqrt(s + epsilon)
+        x = x * g + b
+
         return x
 
 def split_states(x, n):
@@ -48,11 +63,25 @@ def merge_states(x):
     return tf.reshape(x, start + [a*b])
 
 def conv1d(x, scope, nf, *, w_init_stdev=0.02):
-    with tf.variable_scope(scope):
+    # with tf.name_scope(scope):
+    #     *start, nx = shape_list(x)
+    #     w = tf.Variable('w', [1, nx, nf], initializer=tf.random_normal_initializer(stddev=w_init_stdev))
+    #     b = tf.Variable('b', [nf], initializer=tf.constant_initializer(0))
+    #     c = tf.reshape(tf.matmul(tf.reshape(x, [-1, nx]), tf.reshape(w, [-1, nf]))+b, start+[nf])
+    #     return c
+    with tf.name_scope(scope):
         *start, nx = shape_list(x)
-        w = tf.get_variable('w', [1, nx, nf], initializer=tf.random_normal_initializer(stddev=w_init_stdev))
-        b = tf.get_variable('b', [nf], initializer=tf.constant_initializer(0))
-        c = tf.reshape(tf.matmul(tf.reshape(x, [-1, nx]), tf.reshape(w, [-1, nf]))+b, start+[nf])
+
+        w_initial = lambda: tf.random.normal([1, nx, nf], stddev=w_init_stdev)
+        w = tf.Variable(initial_value=w_initial, trainable=True, name='w')
+
+        b_initial = lambda: tf.zeros([nf], dtype=tf.float32)
+        b = tf.Variable(initial_value=b_initial, trainable=True, name='b')
+
+        # Sua lógica de convolução aqui
+        c = tf.reshape(tf.matmul(tf.reshape(x, [-1, nx]), tf.reshape(w, [-1, nf])) + b, start + [nf])
+
+        
         return c
 
 def attention_mask(nd, ns, *, dtype):
@@ -68,13 +97,13 @@ def attention_mask(nd, ns, *, dtype):
 
 def attn(x, scope, n_state, *, past, hparams):
     assert x.shape.ndims == 3  # Should be [batch, sequence, features]
-    assert n_state % hparams.n_head == 0
+    assert n_state % hparams['n_head'] == 0
     if past is not None:
         assert past.shape.ndims == 5  # Should be [batch, 2, heads, sequence, features], where 2 is [k, v]
 
     def split_heads(x):
         # From [batch, sequence, features] to [batch, heads, sequence, features]
-        return tf.transpose(split_states(x, hparams.n_head), [0, 2, 1, 3])
+        return tf.transpose(split_states(x, hparams['n_head']), [0, 2, 1, 3])
 
     def merge_heads(x):
         # Reverse of split_heads
@@ -91,14 +120,14 @@ def attn(x, scope, n_state, *, past, hparams):
     def multihead_attn(q, k, v):
         # q, k, v have shape [batch, heads, sequence, features]
         w = tf.matmul(q, k, transpose_b=True)
-        w = w * tf.rsqrt(tf.cast(v.shape[-1].value, w.dtype))
+        w = w * tf.math.rsqrt(tf.cast(v.shape[-1], w.dtype))
 
         w = mask_attn_weights(w)
         w = softmax(w)
         a = tf.matmul(w, v)
         return a
 
-    with tf.variable_scope(scope):
+    with tf.name_scope(scope):
         c = conv1d(x, 'c_attn', n_state*3)
         q, k, v = map(split_heads, tf.split(c, 3, axis=2))
         present = tf.stack([k, v], axis=1)
@@ -113,16 +142,16 @@ def attn(x, scope, n_state, *, past, hparams):
 
 
 def mlp(x, scope, n_state, *, hparams):
-    with tf.variable_scope(scope):
-        nx = x.shape[-1].value
+    with tf.name_scope(scope):
+        nx = x.shape[-1]
         h = gelu(conv1d(x, 'c_fc', n_state))
         h2 = conv1d(h, 'c_proj', nx)
         return h2
 
 
 def block(x, scope, *, past, hparams):
-    with tf.variable_scope(scope):
-        nx = x.shape[-1].value
+    with tf.name_scope(scope):
+        nx = x.shape[-1]
         a, present = attn(norm(x, 'ln_1'), 'attn', nx, past=past, hparams=hparams)
         x = x + a
         m = mlp(norm(x, 'ln_2'), 'mlp', nx*4, hparams=hparams)
@@ -130,7 +159,7 @@ def block(x, scope, *, past, hparams):
         return x, present
 
 def past_shape(*, hparams, batch_size=None, sequence=None):
-    return [batch_size, hparams.n_layer, 2, hparams.n_head, sequence, hparams.n_embd // hparams.n_head]
+    return [batch_size, hparams['n_layer'], 2, hparams['n_head'], sequence, hparams['n_embd'] // hparams['n_head']]
 
 def expand_tile(value, size):
     """Add a new axis of given size."""
@@ -145,21 +174,28 @@ def positions_for(tokens, past_length):
 
 
 def model(hparams, X, past=None, scope='model', reuse=False):
-    with tf.variable_scope(scope, reuse=reuse):
+    # with tf.variable_scope(scope, reuse=reuse):
+    #     results = {}
+    #     batch, sequence = shape_list(X)
+
+    #     wpe = tf.get_variable('wpe', [hparams.n_ctx, hparams.n_embd],
+    #                          initializer=tf.random_normal_initializer(stddev=0.01))
+    #     wte = tf.get_variable('wte', [hparams.n_vocab, hparams.n_embd],
+    #                          initializer=tf.random_normal_initializer(stddev=0.02))
+    #     past_length = 0 if past is None else tf.shape(past)[-2]
+    #     h = tf.gather(wte, X) + tf.gather(wpe, positions_for(X, past_length))
         results = {}
         batch, sequence = shape_list(X)
 
-        wpe = tf.get_variable('wpe', [hparams.n_ctx, hparams.n_embd],
-                             initializer=tf.random_normal_initializer(stddev=0.01))
-        wte = tf.get_variable('wte', [hparams.n_vocab, hparams.n_embd],
-                             initializer=tf.random_normal_initializer(stddev=0.02))
+        wpe = tf.Variable(lambda:tf.random.normal([hparams['n_ctx'], hparams['n_embd']], stddev=0.01), name='wpe')
+        wte = tf.Variable(lambda:tf.random.normal([hparams['n_vocab'], hparams['n_embd']], stddev=0.02), name='wte')
         past_length = 0 if past is None else tf.shape(past)[-2]
         h = tf.gather(wte, X) + tf.gather(wpe, positions_for(X, past_length))
 
         # Transformer
         presents = []
-        pasts = tf.unstack(past, axis=1) if past is not None else [None] * hparams.n_layer
-        assert len(pasts) == hparams.n_layer
+        pasts = tf.unstack(past, axis=1) if past is not None else [None] * hparams['n_layer']
+        assert len(pasts) == hparams['n_layer']
         for layer, past in enumerate(pasts):
             h, present = block(h, 'h%d' % layer, past=past, hparams=hparams)
             presents.append(present)
@@ -167,8 +203,8 @@ def model(hparams, X, past=None, scope='model', reuse=False):
         h = norm(h, 'ln_f')
 
         # Language model loss.  Do tokens <n predict token n?
-        h_flat = tf.reshape(h, [batch*sequence, hparams.n_embd])
+        h_flat = tf.reshape(h, [batch*sequence, hparams['n_embd']])
         logits = tf.matmul(h_flat, wte, transpose_b=True)
-        logits = tf.reshape(logits, [batch, sequence, hparams.n_vocab])
+        logits = tf.reshape(logits, [batch, sequence, hparams['n_vocab']])
         results['logits'] = logits
         return results
